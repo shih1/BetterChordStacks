@@ -1,308 +1,564 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
-StepSequencerAudioProcessor::StepSequencerAudioProcessor()
+//==============================================================================
+// MPE Channel Manager Implementation
+//==============================================================================
+MPEChannelManager::MPEChannelManager()
+{
+    reset();
+}
+
+int MPEChannelManager::assignChannel()
+{
+    if (availableChannels.empty())
+        return -1;
+
+    int channel = availableChannels.front();
+    availableChannels.erase(availableChannels.begin());
+    usedChannels.insert(channel);
+    return channel;
+}
+
+void MPEChannelManager::releaseChannel(int channel)
+{
+    if (usedChannels.count(channel))
+    {
+        usedChannels.erase(channel);
+        availableChannels.push_back(channel);
+    }
+}
+
+void MPEChannelManager::reset()
+{
+    availableChannels.clear();
+    usedChannels.clear();
+    // MPE Lower Zone: channels 2-16 (channel 1 is master)
+    for (int i = 2; i <= 16; ++i)
+        availableChannels.push_back(i);
+}
+
+int MPEChannelManager::getAvailableChannelCount() const
+{
+    return (int)availableChannels.size();
+}
+
+//==============================================================================
+// Voice Mapper Implementation
+//==============================================================================
+std::vector<std::pair<int, std::vector<int>>> VoiceMapper::mapNotes(
+    const std::vector<int> &currentNotes,
+    const std::vector<int> &nextNotes,
+    Strategy strategy)
+{
+    std::vector<std::pair<int, std::vector<int>>> mapping;
+
+    if (currentNotes.empty() || nextNotes.empty())
+        return mapping;
+
+    if (strategy == NearestNote)
+    {
+        // Build nearest-note mapping with expansion support
+        std::vector<bool> targetUsed(nextNotes.size(), false);
+
+        // Create initial mapping
+        for (size_t i = 0; i < currentNotes.size(); ++i)
+        {
+            mapping.push_back({currentNotes[i], {}});
+        }
+
+        // First pass: assign each source to nearest target
+        for (size_t i = 0; i < currentNotes.size(); ++i)
+        {
+            int current = currentNotes[i];
+            int bestTargetIdx = 0;
+            int minDist = std::abs(current - nextNotes[0]);
+
+            for (size_t j = 0; j < nextNotes.size(); ++j)
+            {
+                int dist = std::abs(current - nextNotes[j]);
+                if (dist < minDist)
+                {
+                    minDist = dist;
+                    bestTargetIdx = (int)j;
+                }
+            }
+
+            mapping[i].second.push_back(nextNotes[bestTargetIdx]);
+            targetUsed[bestTargetIdx] = true;
+        }
+
+        // Handle unassigned targets - distribute to nearest sources
+        for (size_t i = 0; i < nextNotes.size(); ++i)
+        {
+            if (!targetUsed[i])
+            {
+                // Find nearest source note
+                int nearestSourceIdx = 0;
+                int minDist = std::abs(nextNotes[i] - currentNotes[0]);
+
+                for (size_t j = 0; j < currentNotes.size(); ++j)
+                {
+                    int dist = std::abs(nextNotes[i] - currentNotes[j]);
+                    if (dist < minDist)
+                    {
+                        minDist = dist;
+                        nearestSourceIdx = (int)j;
+                    }
+                }
+
+                mapping[nearestSourceIdx].second.push_back(nextNotes[i]);
+            }
+        }
+    }
+    else if (strategy == Random)
+    {
+        static std::random_device rd;
+        static std::mt19937 gen(rd());
+
+        std::vector<int> remainingTargets = nextNotes;
+
+        for (int current : currentNotes)
+        {
+            std::vector<int> targets;
+
+            if (!remainingTargets.empty())
+            {
+                std::uniform_int_distribution<> dist(0, (int)remainingTargets.size() - 1);
+                int idx = dist(gen);
+                targets.push_back(remainingTargets[idx]);
+                remainingTargets.erase(remainingTargets.begin() + idx);
+            }
+
+            mapping.push_back({current, targets});
+        }
+
+        // Distribute remaining targets randomly
+        while (!remainingTargets.empty())
+        {
+            std::uniform_int_distribution<> dist(0, (int)mapping.size() - 1);
+            int sourceIdx = dist(gen);
+            mapping[sourceIdx].second.push_back(remainingTargets.back());
+            remainingTargets.pop_back();
+        }
+    }
+
+    return mapping;
+}
+
+//==============================================================================
+// Gliding Voice Implementation
+//==============================================================================
+GlidingVoice::GlidingVoice()
+    : channel(-1), startNote(-1), targetNote(-1),
+      currentPitch(0.0f), samplePosition(0),
+      totalSamples(0), isActive(false), noteOnSent(false),
+      glideStartSample(0)
+{
+}
+
+//==============================================================================
+// Audio Processor Implementation
+//==============================================================================
+BetterChordStacksAudioProcessor::BetterChordStacksAudioProcessor()
     : AudioProcessor(BusesProperties()
-                         .withOutput("Output", juce::AudioChannelSet::mono(), true)),
+                         .withInput("Input", juce::AudioChannelSet::stereo(), true)
+                         .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
       apvts(*this, nullptr, "Parameters", createParameterLayout())
 {
 }
 
-StepSequencerAudioProcessor::~StepSequencerAudioProcessor()
+BetterChordStacksAudioProcessor::~BetterChordStacksAudioProcessor()
 {
 }
 
-// Define NoteDivision struct
-struct NoteDivision
+juce::AudioProcessorValueTreeState::ParameterLayout BetterChordStacksAudioProcessor::createParameterLayout()
 {
-    const char *label;
-    float multiplier; // in beats relative to quarter note
-};
+    juce::AudioProcessorValueTreeState::ParameterLayout layout;
 
-// List of musical note divisions, relative to 1 quarter note
-static const NoteDivision noteDivisions[] = {
-    {"1/64", 0.0625f},
-    {"1/64T", 0.0417f},
-    {"1/32", 0.125f},
-    {"1/32T", 0.0833f},
-    {"1/16", 0.25f},
-    {"1/16T", 0.1667f},
-    {"1/8", 0.5f},
-    {"1/8T", 0.333f},
-    {"1/4", 1.0f},
-    {"1/4T", 0.666f},
-    {"1/2", 2.0f},
-    {"1/2T", 1.333f},
-    {"1 bar", 4.0f}};
-
-// Convert ms to musical label based on BPM
-juce::String getMusicalLabel(float ms, float bpm)
-{
-    // Convert ms to beats
-    const float beatDurationMs = 60000.0f / bpm;
-    const float beats = ms / beatDurationMs;
-
-    const NoteDivision *closest = nullptr;
-    float minError = std::numeric_limits<float>::max();
-
-    for (const auto &div : noteDivisions)
-    {
-        float error = std::abs(div.multiplier - beats);
-        if (error < minError)
-        {
-            minError = error;
-            closest = &div;
-        }
-    }
-
-    if (closest)
-        return juce::String(ms, 1) + " ms (" + closest->label + ")";
-    else
-        return juce::String(ms, 1) + " ms";
-}
-
-juce::AudioProcessorValueTreeState::ParameterLayout StepSequencerAudioProcessor::createParameterLayout()
-{
-    std::vector<std::unique_ptr<juce::RangedAudioParameter>> params;
-
-    // 8 step pitch parameters (±12 semitones)
-    for (int i = 0; i < NUM_STEPS; ++i)
-    {
-        params.push_back(std::make_unique<juce::AudioParameterFloat>(
-            juce::ParameterID("step" + juce::String(i), 1),
-            "Step " + juce::String(i + 1),
-            juce::NormalisableRange<float>(-12.0f, 12.0f, 0.01f),
-            0.0f,
-            juce::AudioParameterFloatAttributes()
-                .withLabel("st")
-                .withStringFromValueFunction([](float value, int)
-                                             { return juce::String(value, 1); })));
-    }
-
-    params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID("rate", 1),
-        "Rate",
-        juce::NormalisableRange<float>(10.0f, 500.0f, 0.1f), // reduced max to 500 ms
-        100.0f,                                              // default value somewhere in the lower range
-        juce::AudioParameterFloatAttributes()
-            .withStringFromValueFunction([this](float value, int)
-                                         {
-            float bpm = currentBpm.load();
-            return getMusicalLabel(value, bpm); })));
-
-    // Gate length (up to 100%, but we'll extend it slightly for glide when at max)
-    params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID("gate", 1),
-        "Gate",
-        juce::NormalisableRange<float>(0.01f, 1.0f, 0.01f),
-        0.5f,
-        juce::AudioParameterFloatAttributes()
-            .withLabel("%")
-            .withStringFromValueFunction([](float value, int)
-                                         { return juce::String((int)(value * 100)) + "%"; })));
-
-    // Glide enable
-    params.push_back(std::make_unique<juce::AudioParameterBool>(
-        juce::ParameterID("glide_enable", 1),
-        "Glide",
-        false));
-
-    // Glide time in milliseconds
-    params.push_back(std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID("glide_time", 1),
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        "glideTime",
         "Glide Time",
-        juce::NormalisableRange<float>(1.0f, 1000.0f, 1.0f, 0.3f),
-        50.0f,
-        juce::AudioParameterFloatAttributes()
-            .withLabel("ms")
-            .withStringFromValueFunction([](float value, int)
-                                         { return juce::String((int)value) + " ms"; })));
+        juce::NormalisableRange<float>(10.0f, 2000.0f, 1.0f),
+        200.0f,
+        "ms"));
 
-    return {params.begin(), params.end()};
+    layout.add(std::make_unique<juce::AudioParameterChoice>(
+        "strategy",
+        "Mapping Strategy",
+        juce::StringArray{"Nearest Note", "Random"},
+        0));
+
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        "pitchBendRange",
+        "Pitch Bend Range",
+        juce::NormalisableRange<float>(1.0f, 24.0f, 1.0f),
+        12.0f,
+        "semitones"));
+
+    return layout;
 }
 
-void StepSequencerAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
+const juce::String BetterChordStacksAudioProcessor::getName() const
 {
-    juce::ignoreUnused(sampleRate, samplesPerBlock);
-    phase = 0.0f;
-    currentFrequency = 440.0f;
-    targetFrequency = 440.0f;
-    resetSequencer();
+    return JucePlugin_Name;
 }
 
-void StepSequencerAudioProcessor::releaseResources()
+bool BetterChordStacksAudioProcessor::acceptsMidi() const
+{
+    return true;
+}
+
+bool BetterChordStacksAudioProcessor::producesMidi() const
+{
+    return true;
+}
+
+bool BetterChordStacksAudioProcessor::isMidiEffect() const
+{
+    return true;
+}
+
+double BetterChordStacksAudioProcessor::getTailLengthSeconds() const
+{
+    return 0.0;
+}
+
+int BetterChordStacksAudioProcessor::getNumPrograms()
+{
+    return 1;
+}
+
+int BetterChordStacksAudioProcessor::getCurrentProgram()
+{
+    return 0;
+}
+
+void BetterChordStacksAudioProcessor::setCurrentProgram(int index)
+{
+    juce::ignoreUnused(index);
+}
+
+const juce::String BetterChordStacksAudioProcessor::getProgramName(int index)
+{
+    juce::ignoreUnused(index);
+    return {};
+}
+
+void BetterChordStacksAudioProcessor::changeProgramName(int index, const juce::String &newName)
+{
+    juce::ignoreUnused(index, newName);
+}
+
+void BetterChordStacksAudioProcessor::prepareToPlay(double newSampleRate, int samplesPerBlock)
+{
+    juce::ignoreUnused(samplesPerBlock);
+
+    sampleRate = newSampleRate;
+
+    float glideTimeMs = *apvts.getRawParameterValue("glideTime");
+    lookaheadSamples = static_cast<int>((glideTimeMs / 1000.0f) * sampleRate);
+
+    channelManager.reset();
+    glidingVoices.clear();
+    midiBuffer.clear();
+    currentChord.clear();
+    pendingChord.clear();
+    hasCurrentChord = false;
+    hasPendingChord = false;
+    currentSampleOffset = 0;
+
+    setLatencySamples(lookaheadSamples);
+}
+
+void BetterChordStacksAudioProcessor::releaseResources()
 {
 }
 
-bool StepSequencerAudioProcessor::isBusesLayoutSupported(const BusesLayout &layouts) const
+bool BetterChordStacksAudioProcessor::isBusesLayoutSupported(const BusesLayout &layouts) const
 {
-    return layouts.getMainOutputChannelSet() == juce::AudioChannelSet::mono();
+    return layouts.getMainOutputChannelSet() == juce::AudioChannelSet::stereo() && layouts.getMainInputChannelSet() == layouts.getMainOutputChannelSet();
 }
 
-void StepSequencerAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce::MidiBuffer &midiMessages)
+void BetterChordStacksAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer, juce::MidiBuffer &midiMessages)
 {
     juce::ScopedNoDenormals noDenormals;
     buffer.clear();
 
-    if (auto *playHead = getPlayHead())
-    {
-        if (auto posInfo = playHead->getPosition())
-        {
-            lastPosInfo = *posInfo;
+    juce::MidiBuffer outputMidi;
+    int numSamples = buffer.getNumSamples();
 
-            if (auto bpmOpt = lastPosInfo.getBpm())
-            {
-                currentBpm.store(*bpmOpt); // Use atomic store
-            }
+    // Update lookahead if glide time changed
+    float glideTimeMs = *apvts.getRawParameterValue("glideTime");
+    int newLookahead = static_cast<int>((glideTimeMs / 1000.0f) * sampleRate);
+    if (newLookahead != lookaheadSamples)
+    {
+        lookaheadSamples = newLookahead;
+        setLatencySamples(lookaheadSamples);
+    }
+
+    bufferMidiMessages(midiMessages, numSamples);
+    processBufferedMidi(outputMidi, numSamples);
+
+    midiMessages.swapWith(outputMidi);
+    currentSampleOffset += numSamples;
+}
+
+void BetterChordStacksAudioProcessor::bufferMidiMessages(const juce::MidiBuffer &input, int numSamples)
+{
+    juce::ignoreUnused(numSamples);
+
+    for (const auto metadata : input)
+    {
+        auto msg = metadata.getMessage();
+        int globalSamplePos = currentSampleOffset + metadata.samplePosition;
+
+        if (msg.isNoteOn() || msg.isNoteOff())
+        {
+            midiBuffer.push_back(BufferedMidiMessage(msg, globalSamplePos));
+        }
+    }
+}
+
+void BetterChordStacksAudioProcessor::processBufferedMidi(juce::MidiBuffer &output, int numSamples)
+{
+    int outputStartSample = currentSampleOffset;
+    int outputEndSample = currentSampleOffset + numSamples;
+
+    std::map<int, std::vector<BufferedMidiMessage>> notesByTimestamp;
+
+    for (const auto &buffered : midiBuffer)
+    {
+        if (buffered.message.isNoteOn() &&
+            buffered.samplePosition < outputEndSample + lookaheadSamples)
+        {
+            notesByTimestamp[buffered.samplePosition].push_back(buffered);
         }
     }
 
-    double bpm = currentBpm.load();
-    double sampleRate = getSampleRate();
-
-    auto rateParam = apvts.getRawParameterValue("rate")->load();
-    auto gateParam = apvts.getRawParameterValue("gate")->load();
-    auto glideEnable = apvts.getRawParameterValue("glide_enable")->load() > 0.5f;
-    auto glideTimeMs = apvts.getRawParameterValue("glide_time")->load();
-
-    stepLengthInSamples = calculateStepLength(sampleRate, rateParam);
-
-    // Calculate glide rate (frequency change per sample)
-    if (glideEnable && glideTimeMs > 0.0f)
+    for (auto &[timestamp, notes] : notesByTimestamp)
     {
-        float glideTimeSamples = (glideTimeMs / 1000.0f) * sampleRate;
-        glideRate = 1.0f / glideTimeSamples;
+        if (notes.size() >= 2)
+        {
+            detectChord(notes);
+        }
+    }
+
+    if (hasCurrentChord && hasPendingChord)
+    {
+        int glideStartTime = pendingChordTimestamp - lookaheadSamples;
+
+        if (currentSampleOffset >= glideStartTime && glidingVoices.empty())
+        {
+            startGlideTransition();
+        }
+    }
+
+    processGlides(output, outputStartSample, outputEndSample);
+
+    midiBuffer.erase(
+        std::remove_if(midiBuffer.begin(), midiBuffer.end(),
+                       [outputEndSample](const BufferedMidiMessage &msg)
+                       {
+                           return msg.samplePosition < outputEndSample;
+                       }),
+        midiBuffer.end());
+}
+
+void BetterChordStacksAudioProcessor::detectChord(const std::vector<BufferedMidiMessage> &simultaneousNotes)
+{
+    std::vector<int> notes;
+    int timestamp = simultaneousNotes[0].samplePosition;
+
+    for (const auto &buffered : simultaneousNotes)
+    {
+        notes.push_back(buffered.message.getNoteNumber());
+    }
+
+    std::sort(notes.begin(), notes.end());
+
+    if (!hasCurrentChord)
+    {
+        currentChord = notes;
+        hasCurrentChord = true;
+
+        for (int note : currentChord)
+        {
+            int channel = channelManager.assignChannel();
+            if (channel != -1)
+            {
+                GlidingVoice voice;
+                voice.channel = channel;
+                voice.startNote = note;
+                voice.targetNote = note;
+                voice.currentPitch = 0.0f;
+                voice.isActive = true;
+                voice.noteOnSent = false;
+                voice.glideStartSample = timestamp;
+                voice.samplePosition = 0;
+                voice.totalSamples = 0;
+                glidingVoices.push_back(voice);
+            }
+        }
+    }
+    else if (!hasPendingChord)
+    {
+        pendingChord = notes;
+        hasPendingChord = true;
+        pendingChordTimestamp = timestamp;
     }
     else
     {
-        glideRate = 1.0f; // Instant change
+        pendingChord = notes;
+        pendingChordTimestamp = timestamp;
     }
+}
 
-    // Process MIDI
-    for (const auto metadata : midiMessages)
-    {
-        auto msg = metadata.getMessage();
-
-        if (msg.isNoteOn())
-        {
-            isNoteOn = true;
-            baseNote = msg.getNoteNumber();
-            resetSequencer();
-            gateIsOn = true;
-            gateOffSamples = stepLengthInSamples * gateParam;
-        }
-        else if (msg.isNoteOff())
-        {
-            isNoteOn = false;
-            gateIsOn = false;
-        }
-    }
-
-    if (!isNoteOn)
+void BetterChordStacksAudioProcessor::startGlideTransition()
+{
+    if (!hasCurrentChord || !hasPendingChord)
         return;
 
-    auto *outputData = buffer.getWritePointer(0);
+    int strategyIndex = static_cast<int>(*apvts.getRawParameterValue("strategy"));
+    VoiceMapper::Strategy strategy = strategyIndex == 0 ? VoiceMapper::NearestNote : VoiceMapper::Random;
 
-    for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
+    auto mapping = VoiceMapper::mapNotes(currentChord, pendingChord, strategy);
+
+    for (auto &voice : glidingVoices)
     {
-        // Check if we need to advance to next step
-        if (samplesUntilNextStep <= 0.0)
+        if (voice.channel != -1)
+            channelManager.releaseChannel(voice.channel);
+    }
+    glidingVoices.clear();
+
+    int glideStartSample = pendingChordTimestamp - lookaheadSamples;
+
+    for (auto &[sourceNote, targetNotes] : mapping)
+    {
+        for (size_t i = 0; i < targetNotes.size(); ++i)
         {
-            advanceStep();
-            samplesUntilNextStep = stepLengthInSamples;
-            gateOffSamples = stepLengthInSamples * gateParam;
-            gateIsOn = true;
+            int channel = channelManager.assignChannel();
+            if (channel == -1)
+                continue;
+
+            GlidingVoice voice;
+            voice.channel = channel;
+            voice.startNote = sourceNote;
+            voice.targetNote = targetNotes[i];
+            voice.currentPitch = 0.0f;
+            voice.samplePosition = 0;
+            voice.totalSamples = lookaheadSamples;
+            voice.isActive = true;
+            voice.noteOnSent = false;
+            voice.glideStartSample = glideStartSample;
+
+            glidingVoices.push_back(voice);
+        }
+    }
+
+    currentChord = pendingChord;
+    pendingChord.clear();
+    hasPendingChord = false;
+}
+
+void BetterChordStacksAudioProcessor::processGlides(juce::MidiBuffer &output, int startSample, int endSample)
+{
+    for (auto &voice : glidingVoices)
+    {
+        if (!voice.isActive)
+            continue;
+
+        if (!voice.noteOnSent && voice.glideStartSample >= startSample &&
+            voice.glideStartSample < endSample)
+        {
+            int localSample = voice.glideStartSample - startSample;
+            output.addEvent(juce::MidiMessage::noteOn(voice.channel, voice.startNote, (juce::uint8)100),
+                            localSample);
+            voice.noteOnSent = true;
+            sendPitchBend(output, voice.channel, 0.0f, localSample);
         }
 
-        // Check gate
-        if (gateOffSamples <= 0.0)
-            gateIsOn = false;
+        if (!voice.noteOnSent)
+            continue;
 
-        // Apply glide to frequency
-        if (currentFrequency != targetFrequency)
+        for (int sample = startSample; sample < endSample; ++sample)
         {
-            if (glideRate >= 1.0f)
+            if (sample < voice.glideStartSample)
+                continue;
+
+            int glideElapsed = sample - voice.glideStartSample;
+
+            if (glideElapsed <= voice.totalSamples)
             {
-                currentFrequency = targetFrequency;
+                float progress = voice.totalSamples > 0 ? (float)glideElapsed / (float)voice.totalSamples : 1.0f;
+
+                float targetPitchOffset = (float)(voice.targetNote - voice.startNote);
+                voice.currentPitch = targetPitchOffset * progress;
+
+                if ((glideElapsed % 8) == 0 || glideElapsed == voice.totalSamples)
+                {
+                    sendPitchBend(output, voice.channel, voice.currentPitch, sample - startSample);
+                }
+
+                voice.samplePosition = glideElapsed;
             }
-            else
+
+            if (glideElapsed == voice.totalSamples)
             {
-                float diff = targetFrequency - currentFrequency;
-                currentFrequency += diff * glideRate;
+                int localSample = sample - startSample;
 
-                // Snap to target if very close
-                if (std::abs(targetFrequency - currentFrequency) < 0.1f)
-                    currentFrequency = targetFrequency;
+                output.addEvent(juce::MidiMessage::noteOff(voice.channel, voice.startNote, (juce::uint8)0),
+                                localSample);
+
+                if (voice.targetNote != voice.startNote)
+                {
+                    output.addEvent(juce::MidiMessage::noteOn(voice.channel, voice.targetNote, (juce::uint8)100),
+                                    localSample);
+                }
+
+                sendPitchBend(output, voice.channel, 0.0f, localSample);
+
+                voice.startNote = voice.targetNote;
+                voice.totalSamples = 0;
             }
         }
-
-        // Generate saw wave
-        float output = 0.0f;
-        if (gateIsOn)
-        {
-            output = (phase * 2.0f - 1.0f) * 0.3f; // Saw wave with volume scaling
-        }
-
-        outputData[sample] = output;
-
-        // Update phase
-        phase += currentFrequency / (float)sampleRate;
-        if (phase >= 1.0f)
-            phase -= 1.0f;
-
-        samplesUntilNextStep -= 1.0;
-        gateOffSamples -= 1.0;
     }
 }
 
-void StepSequencerAudioProcessor::advanceStep()
+void BetterChordStacksAudioProcessor::sendPitchBend(juce::MidiBuffer &buffer, int channel,
+                                                    float pitchInSemitones, int sampleOffset)
 {
-    currentStep = (currentStep + 1) % NUM_STEPS;
-    updateFrequency();
+    float pitchBendRange = *apvts.getRawParameterValue("pitchBendRange");
+    float normalizedPitch = pitchInSemitones / pitchBendRange;
+    normalizedPitch = juce::jlimit(-1.0f, 1.0f, normalizedPitch);
+
+    int pitchBendValue = static_cast<int>((normalizedPitch * 8192.0f) + 8192.0f);
+    pitchBendValue = juce::jlimit(0, 16383, pitchBendValue);
+
+    buffer.addEvent(juce::MidiMessage::pitchWheel(channel, pitchBendValue), sampleOffset);
 }
 
-void StepSequencerAudioProcessor::resetSequencer()
+bool BetterChordStacksAudioProcessor::hasEditor() const
 {
-    currentStep = -1;           // Start at -1 so first advance goes to step 0
-    samplesUntilNextStep = 0.0; // Trigger first step immediately
+    return true;
 }
 
-void StepSequencerAudioProcessor::updateFrequency()
+juce::AudioProcessorEditor *BetterChordStacksAudioProcessor::createEditor()
 {
-    auto stepPitch = apvts.getRawParameterValue("step" + juce::String(currentStep))->load();
-    float midiNote = baseNote + stepPitch;
-    targetFrequency = 440.0f * std::pow(2.0f, (midiNote - 69.0f) / 12.0f);
-
-    // If glide is off, snap immediately
-    auto glideEnable = apvts.getRawParameterValue("glide_enable")->load() > 0.5f;
-    if (!glideEnable)
-        currentFrequency = targetFrequency;
+    return new BetterChordStacksAudioProcessorEditor(*this);
 }
 
-double StepSequencerAudioProcessor::calculateStepLength(double sampleRate, float rateMs)
-{
-    // Convert ms to seconds
-    double seconds = rateMs / 1000.0;
-
-    // Convert to samples
-    return seconds * sampleRate;
-}
-
-juce::AudioProcessorEditor *StepSequencerAudioProcessor::createEditor()
-{
-    return new StepSequencerAudioProcessorEditor(*this);
-}
-
-void StepSequencerAudioProcessor::getStateInformation(juce::MemoryBlock &destData)
+void BetterChordStacksAudioProcessor::getStateInformation(juce::MemoryBlock &destData)
 {
     auto state = apvts.copyState();
     std::unique_ptr<juce::XmlElement> xml(state.createXml());
     copyXmlToBinary(*xml, destData);
 }
 
-void StepSequencerAudioProcessor::setStateInformation(const void *data, int sizeInBytes)
+void BetterChordStacksAudioProcessor::setStateInformation(const void *data, int sizeInBytes)
 {
     std::unique_ptr<juce::XmlElement> xmlState(getXmlFromBinary(data, sizeInBytes));
+
     if (xmlState.get() != nullptr)
         if (xmlState->hasTagName(apvts.state.getType()))
             apvts.replaceState(juce::ValueTree::fromXml(*xmlState));
@@ -310,5 +566,5 @@ void StepSequencerAudioProcessor::setStateInformation(const void *data, int size
 
 juce::AudioProcessor *JUCE_CALLTYPE createPluginFilter()
 {
-    return new StepSequencerAudioProcessor();
+    return new BetterChordStacksAudioProcessor();
 }
