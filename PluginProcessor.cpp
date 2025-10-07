@@ -319,24 +319,83 @@ void BetterChordStacksAudioProcessor::bufferMidiMessages(const juce::MidiBuffer 
         }
     }
 }
-
 void BetterChordStacksAudioProcessor::processBufferedMidi(juce::MidiBuffer &output, int numSamples)
 {
     int outputStartSample = currentSampleOffset;
     int outputEndSample = currentSampleOffset + numSamples;
 
-    std::map<int, std::vector<BufferedMidiMessage>> notesByTimestamp;
+    // Separate note-ons and note-offs
+    std::map<int, std::vector<BufferedMidiMessage>> noteOnsByTimestamp;
+    std::vector<BufferedMidiMessage> noteOffs;
 
     for (const auto &buffered : midiBuffer)
     {
         if (buffered.message.isNoteOn() &&
             buffered.samplePosition < outputEndSample + lookaheadSamples)
         {
-            notesByTimestamp[buffered.samplePosition].push_back(buffered);
+            noteOnsByTimestamp[buffered.samplePosition].push_back(buffered);
+        }
+        else if (buffered.message.isNoteOff() &&
+                 buffered.samplePosition >= outputStartSample &&
+                 buffered.samplePosition < outputEndSample)
+        {
+            noteOffs.push_back(buffered);
         }
     }
 
-    for (auto &[timestamp, notes] : notesByTimestamp)
+    // Process note-offs (release current chord)
+    for (const auto &noteOff : noteOffs)
+    {
+        int noteNum = noteOff.message.getNoteNumber();
+
+        // Check if this note is part of the current chord
+        auto it = std::find(currentChord.begin(), currentChord.end(), noteNum);
+        if (it != currentChord.end())
+        {
+            // Remove from current chord
+            currentChord.erase(it);
+
+            // Stop corresponding voice - find voices matching this note
+            for (auto &voice : glidingVoices)
+            {
+                if ((voice.startNote == noteNum || voice.targetNote == noteNum) &&
+                    voice.isActive && voice.channel != -1)
+                {
+                    int localSample = noteOff.samplePosition - outputStartSample;
+                    localSample = juce::jlimit(0, numSamples - 1, localSample);
+
+                    // Send note-off BEFORE releasing channel
+                    output.addEvent(juce::MidiMessage::noteOff(voice.channel, voice.startNote, (juce::uint8)0),
+                                    localSample);
+
+                    // Now release the channel and mark inactive
+                    channelManager.releaseChannel(voice.channel);
+                    voice.isActive = false;
+                    voice.channel = -1;
+                }
+            }
+
+            // If chord is now empty, reset state
+            if (currentChord.empty())
+            {
+                hasCurrentChord = false;
+
+                // Clean up remaining voices
+                for (auto &voice : glidingVoices)
+                {
+                    if (voice.channel != -1)
+                    {
+                        channelManager.releaseChannel(voice.channel);
+                        voice.channel = -1;
+                    }
+                }
+                glidingVoices.clear();
+            }
+        }
+    }
+
+    // Process note-ons (detect new chords)
+    for (auto &[timestamp, notes] : noteOnsByTimestamp)
     {
         if (notes.size() >= 2)
         {
@@ -344,6 +403,7 @@ void BetterChordStacksAudioProcessor::processBufferedMidi(juce::MidiBuffer &outp
         }
     }
 
+    // Start glide transition if ready
     if (hasCurrentChord && hasPendingChord)
     {
         int glideStartTime = pendingChordTimestamp - lookaheadSamples;
@@ -354,8 +414,10 @@ void BetterChordStacksAudioProcessor::processBufferedMidi(juce::MidiBuffer &outp
         }
     }
 
+    // Process glides
     processGlides(output, outputStartSample, outputEndSample);
 
+    // Clean up processed messages
     midiBuffer.erase(
         std::remove_if(midiBuffer.begin(), midiBuffer.end(),
                        [outputEndSample](const BufferedMidiMessage &msg)
