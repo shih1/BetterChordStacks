@@ -536,6 +536,12 @@ BetterChordStacksAudioProcessor::BetterChordStacksAudioProcessor()
                          .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
       apvts_(*this, nullptr, "Parameters", createParameterLayout()), nearestNoteStrategy_(std::make_unique<NearestNoteMapping>()), randomStrategy_(std::make_unique<RandomMapping>())
 {
+
+    // In BetterChordStacksAudioProcessor constructor:
+    auto desktopPath = juce::File::getSpecialLocation(juce::File::userDesktopDirectory);
+    auto logFile = desktopPath.getChildFile("BetterChordStacks_Debug.txt");
+    debugLogger_ = std::make_unique<juce::FileLogger>(logFile, "=== BetterChordStacks Debug Log ===");
+    debugLogger_->logMessage("Plugin initialized");
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout
@@ -606,6 +612,57 @@ void BetterChordStacksAudioProcessor::processBlock(juce::AudioBuffer<float> &buf
     const auto &strategy = getCurrentMappingStrategy();
     engine_.processBlock(midiMessages, buffer.getNumSamples(),
                          glideTimeMs, pitchBendRange, strategy);
+
+    engine_.processBlock_WithDebug(midiMessages, buffer.getNumSamples(),
+                                   glideTimeMs, pitchBendRange, strategy, debugLogger_.get());
+}
+
+void ChordTransitionEngine::processBlock_WithDebug(
+    juce::MidiBuffer &midiMessages,
+    int numSamples,
+    float glideTimeMs,
+    float pitchBendRange,
+    const VoiceMappingStrategy &mappingStrategy,
+    juce::FileLogger *logger) // Pass logger from processor
+{
+    pitchBendRange_ = pitchBendRange;
+
+    if (logger)
+    {
+        logger->logMessage("ENGINE: processBlock called with " +
+                           juce::String(numSamples) + " samples");
+        logger->logMessage("ENGINE: currentGlobalTime = " +
+                           juce::String(currentGlobalTime_));
+        logger->logMessage("ENGINE: lookaheadSamples = " +
+                           juce::String(lookaheadSamples_));
+    }
+
+    juce::MidiBuffer output;
+    int blockStartTime = static_cast<int>(currentGlobalTime_);
+
+    bufferIncomingMidi(midiMessages, blockStartTime);
+
+    if (logger)
+    {
+        logger->logMessage("ENGINE: midiBuffer_ size after buffering: " +
+                           juce::String(midiBuffer_.size()));
+    }
+
+    processBufferedEvents(output, blockStartTime, numSamples, mappingStrategy);
+
+    int outCount = 0;
+    for (const auto metadata : output)
+    {
+        outCount++;
+    }
+
+    if (logger)
+    {
+        logger->logMessage("ENGINE: output buffer has " + juce::String(outCount) + " events");
+    }
+
+    midiMessages.swapWith(output);
+    currentGlobalTime_ += numSamples;
 }
 
 const VoiceMappingStrategy &BetterChordStacksAudioProcessor::getCurrentMappingStrategy() const

@@ -177,6 +177,14 @@ public:
                       float pitchBendRange,
                       const VoiceMappingStrategy &mappingStrategy);
 
+    void processBlock_WithDebug(
+        juce::MidiBuffer &midiMessages,
+        int numSamples,
+        float glideTimeMs,
+        float pitchBendRange,
+        const VoiceMappingStrategy &mappingStrategy,
+        juce::FileLogger *logger);
+
 private:
     struct BufferedMidiEvent
     {
@@ -250,6 +258,8 @@ public:
     juce::AudioProcessorValueTreeState &getAPVTS() { return apvts_; }
 
 private:
+    std::unique_ptr<juce::FileLogger> debugLogger_;
+
     juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
     const VoiceMappingStrategy &getCurrentMappingStrategy() const;
 
